@@ -23,7 +23,10 @@ import org.apache.flink.api.common.io.FileInputFormat;
 import org.apache.flink.api.common.io.FilePathFilter;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
+import org.apache.flink.api.common.typeinfo.TypeHint;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeutils.base.LongSerializer;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.fs.FileInputSplit;
 import org.apache.flink.core.fs.FileStatus;
@@ -42,6 +45,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -104,6 +108,10 @@ public class ContinuousFileMonitoringFunction<OUT>
 
     private transient ListState<Long> checkpointedState;
 
+    private transient ListState<Tuple2<String, Long>> filePathsForwardedCheckpointedState;
+
+    private final Map<String, Long> filePathsForwarded;
+
     public ContinuousFileMonitoringFunction(
             FileInputFormat<OUT> format,
             FileProcessingMode watchType,
@@ -132,6 +140,7 @@ public class ContinuousFileMonitoringFunction<OUT>
         this.watchType = watchType;
         this.readerParallelism = Math.max(readerParallelism, 1);
         this.globalModificationTime = Long.MIN_VALUE;
+        this.filePathsForwarded = new HashMap<>();
     }
 
     @VisibleForTesting
@@ -146,18 +155,34 @@ public class ContinuousFileMonitoringFunction<OUT>
                 this.checkpointedState == null,
                 "The " + getClass().getSimpleName() + " has already been initialized.");
 
+        Preconditions.checkState(
+                this.filePathsForwardedCheckpointedState == null,
+                "The " + getClass().getSimpleName() + " has already been initialized.");
+
         this.checkpointedState =
                 context.getOperatorStateStore()
                         .getListState(
                                 new ListStateDescriptor<>(
                                         "file-monitoring-state", LongSerializer.INSTANCE));
 
+        ListStateDescriptor<Tuple2<String, Long>> filePathsForwardedStateDescriptor =
+                new ListStateDescriptor<>(
+                        "file-paths-forwarded-state",
+                        TypeInformation.of(new TypeHint<Tuple2<String, Long>>() {}));
+        this.filePathsForwardedCheckpointedState =
+                context.getOperatorStateStore().getListState(filePathsForwardedStateDescriptor);
+
         if (context.isRestored()) {
             LOG.info("Restoring state for the {}.", getClass().getSimpleName());
 
             List<Long> retrievedStates = new ArrayList<>();
+            Map<String, Long> retrievedFilePathsForwarded = new HashMap<>();
             for (Long entry : this.checkpointedState.get()) {
                 retrievedStates.add(entry);
+            }
+
+            for (Tuple2<String, Long> element : this.filePathsForwardedCheckpointedState.get()) {
+                retrievedFilePathsForwarded.put(element.f0, element.f1);
             }
 
             // given that the parallelism of the function is 1, we can only have 1 or 0 retrieved
@@ -188,6 +213,28 @@ public class ContinuousFileMonitoringFunction<OUT>
                 }
             }
 
+            if (retrievedFilePathsForwarded.isEmpty()) {
+                LOG.warn("Received empty filePathsForwarded state from the checkpoint restore.");
+            }
+            if (!filePathsForwarded.isEmpty()) {
+                // this is the case where we have both legacy and new state.
+                // The two should be mutually exclusive for the operator, thus we throw the
+                // exception.
+
+                throw new IllegalArgumentException(
+                        "filePathsForwarded not empty. The "
+                                + getClass().getSimpleName()
+                                + " has already restored from a previous Flink version.");
+            } else {
+                filePathsForwarded.putAll(retrievedFilePathsForwarded);
+                LOG.info(
+                        "Retrieved "
+                                + filePathsForwarded.size()
+                                + " entries to filePathsForwarded");
+                for (Map.Entry<String, Long> e : filePathsForwarded.entrySet()) {
+                    LOG.info(e.getKey() + " " + e.getValue());
+                }
+            }
         } else {
             LOG.info("No state to restore for the {}.", getClass().getSimpleName());
         }
@@ -255,7 +302,14 @@ public class ContinuousFileMonitoringFunction<OUT>
     private void monitorDirAndForwardSplits(
             FileSystem fs, SourceContext<TimestampedFileInputSplit> context) throws IOException {
         assert (Thread.holdsLock(checkpointLock));
-
+        Iterator<Map.Entry<String, Long>> iter = filePathsForwarded.entrySet().iterator();
+        while (iter.hasNext()) {
+            Map.Entry<String, Long> entry = iter.next();
+            Long modificationTime = entry.getValue();
+            if (modificationTime < globalModificationTime - interval) {
+                iter.remove();
+            }
+        }
         Map<Path, FileStatus> eligibleFiles = listEligibleFiles(fs, new Path(path));
         Map<Long, List<TimestampedFileInputSplit>> splitsSortedByModTime =
                 getInputSplitsSortedByModTime(eligibleFiles);
@@ -264,12 +318,14 @@ public class ContinuousFileMonitoringFunction<OUT>
                 splitsSortedByModTime.entrySet()) {
             long modificationTime = splits.getKey();
             for (TimestampedFileInputSplit split : splits.getValue()) {
-                LOG.info("Forwarding split: " + split);
+                LOG.info("Forwarding split: " + split + " modification time : " + modificationTime);
+                filePathsForwarded.put(split.getPath().toString(), modificationTime);
                 context.collect(split);
             }
             // update the global modification time
             globalModificationTime = Math.max(globalModificationTime, modificationTime);
         }
+        LOG.info("New globalModificationTime: " + globalModificationTime);
     }
 
     /**
@@ -356,6 +412,13 @@ public class ContinuousFileMonitoringFunction<OUT>
      */
     private boolean shouldIgnore(Path filePath, long modificationTime) {
         assert (Thread.holdsLock(checkpointLock));
+        String filePathStr = filePath.toString();
+        if (modificationTime >= globalModificationTime - interval
+                && modificationTime <= globalModificationTime
+                && !filePathsForwarded.containsKey(filePathStr)) {
+            LOG.warn("Found path " + filePathStr + " which was skipped in previous cycle.");
+            return false;
+        }
         boolean shouldIgnore = modificationTime <= globalModificationTime;
         if (shouldIgnore && LOG.isDebugEnabled()) {
             LOG.debug(
@@ -409,7 +472,18 @@ public class ContinuousFileMonitoringFunction<OUT>
 
         this.checkpointedState.clear();
         this.checkpointedState.add(this.globalModificationTime);
-
+        this.filePathsForwardedCheckpointedState.clear();
+        filePathsForwarded.entrySet().stream()
+                .map(entry -> Tuple2.of(entry.getKey(), entry.getValue()))
+                .forEach(
+                        tuple -> {
+                            try {
+                                filePathsForwardedCheckpointedState.add(tuple);
+                            } catch (Exception e) {
+                                throw new RuntimeException(
+                                        "Could not checkpoint filePathsForwardedCheckpointedState entry.");
+                            }
+                        });
         if (LOG.isDebugEnabled()) {
             LOG.debug("{} checkpointed {}.", getClass().getSimpleName(), globalModificationTime);
         }
